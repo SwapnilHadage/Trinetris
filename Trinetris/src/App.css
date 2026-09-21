@@ -1,0 +1,24 @@
+.app-root {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-fade-in {
+  animation: appFadeIn 0.35s ease forwards;
+}
+
+.app-fade-out {
+  animation: appFadeOut 0.35s ease forwards;
+}
+
+@keyframes appFadeIn {
+  from { opacity: 0; transform: scale(0.98); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+@keyframes appFadeOut {
+  from { opacity: 1; transform: scale(1); }
+  to   { opacity: 0; transform: scale(0.98); }
+}
