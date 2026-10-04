@@ -1,519 +1,176 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import MiniMap from './MiniMap'
+import TwinCanvas, { pothole } from './SwirVideo'
 import './VehicleDashboard.css'
 
-const VIEWS = ['FRONT', 'LEFT', 'RIGHT', 'BACK']
+const ROAD = { left: -21, center: -7, right: 7, crestA: 9, crestB: 9.9, bermOut: 12.4, bermH: 1.8, bend: 0.0006 }
+const roadX = z => ROAD.bend * z * z
+const RANGE = 100
+const SWIR_RANGE = 55
+const SPEED_LIMIT = 20
+const VISIBILITY_M = 12
+const SENSORS = { ok: 8, total: 8 }
 
-const SPLIT_MODES = [
-  { id: 'single', label: 'SINGLE', icon: '▣' },
-  { id: 'hsplit', label: 'H-SPLIT', icon: '⬒' },
-  { id: 'vsplit', label: 'V-SPLIT', icon: '⬓' },
-  { id: 'quad',   label: 'QUAD',   icon: '⊞' },
-  { id: 'focus3', label: '1+3',    icon: '⊟' },
+const VIEWS = [
+  { id: 'FRONT', label: 'Front', deg: 0 },
+  { id: 'LEFT', label: 'Left', deg: -90 },
+  { id: 'RIGHT', label: 'Right', deg: 90 },
+  { id: 'REAR', label: 'Rear', deg: 180 },
 ]
+const LAYOUTS = [
+  { id: 'single', label: 'Single' },
+  { id: 'focus', label: '1 + 3' },
+  { id: 'quad', label: 'All four' },
+]
+const DIR_WORD = { FRONT: 'ahead', REAR: 'behind', LEFT: 'on left', RIGHT: 'on right' }
+const RANK = { ok: 0, caution: 1, danger: 2 }
+const worse = (a, b) => (RANK[b] > RANK[a] ? b : a)
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v))
+const ONCOMING = new Set(['D-04', 'D-11', 'D-15'])
 
-const VIEW_META = {
-  FRONT: { label: 'FRONT CAM', dir: '↑', heading: '228°', dist: '42 m', veh: 'D-04' },
-  LEFT:  { label: 'LEFT CAM',  dir: '←', heading: '138°', dist: '—',    veh: null },
-  RIGHT: { label: 'RIGHT CAM', dir: '→', heading: '318°', dist: '81 m', veh: 'E-02' },
-  BACK:  { label: 'REAR CAM',  dir: '↓', heading: '048°', dist: '55 m', veh: 'D-08' },
+function derive(t) {
+  t.x = t.u + roadX(t.z)
+  t.dist = Math.hypot(t.x, t.z)
+  t.bearing = (Math.atan2(t.x, t.z) * 180) / Math.PI
+  const b = Math.abs(t.bearing)
+  t.sector = b <= 45 ? 'FRONT' : b >= 135 ? 'REAR' : t.bearing > 0 ? 'RIGHT' : 'LEFT'
+  t.closing = -(t.z * t.vz) / Math.max(t.dist, 1)
+  t.ttc = t.closing > 0.5 ? t.dist / t.closing : Infinity
+  t.inPath = Math.abs(t.u) <= 5.5
+  if (t.inPath) t.sev = t.dist < 20 || t.ttc < 6 ? 'danger' : t.dist < 50 || t.ttc < 12 ? 'caution' : 'ok'
+  else t.sev = t.dist < 12 ? 'danger' : t.dist < 40 ? 'caution' : 'ok'
+  t.swirLim = t.kind === 'debris' ? 30 : SWIR_RANGE
+  t.inSwir = t.dist <= t.swirLim
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Realistic SWIR 1550 nm + 4D 77 GHz Radar Sensor Fusion Canvas
-//
-// 1. MINE SCENE: Open-pit haul road with highwalls (rock cliffs), berms, 
-//    and a wide ore-compacted road. 
-// 2. SWIR VISUALS: True monochromatic representation. High-contrast grayscale, 
-//    pitch-black sky, sharp textures bypassing fog, glowing heat signatures,
-//    heavy sensor grain.
-// 3. MULTIPLE OBJECTS: Vehicles moving at realistic speeds, staying at safe 
-//    distances, plus static obstacles.
-// 4. RADAR FUSION: 4D point cloud clusters mapped onto physical surfaces, 
-//    colored by Doppler (relative velocity).
-// ─────────────────────────────────────────────────────────────────────────────
-function SensorFusionCanvas({ view }) {
-  const canvasRef = useRef(null)
-  const rafRef    = useRef(null)
-  const tRef      = useRef(0)
-  const noiseRef  = useRef(null)
-
-  // Pre-generate SWIR sensor grain (InGaAs read noise)
-  useEffect(() => {
-    const c = document.createElement('canvas')
-    c.width = 512; c.height = 512
-    const ctx = c.getContext('2d')
-    const imgData = ctx.createImageData(c.width, c.height)
-    const buf = new Uint32Array(imgData.data.buffer)
-    for (let i = 0; i < buf.length; i++) {
-      // High-frequency monochrome noise
-      const v = Math.random() * 255
-      buf[i] = (255 << 24) | (v << 16) | (v << 8) | v
-    }
-    ctx.putImageData(imgData, 0, 0)
-    noiseRef.current = c
-  }, [])
-
-  // Scene state: multiple tracked objects
-  const sceneObjects = useRef([
-    // Primary vehicle (tracked by HUD)
-    { id: 'D-07', type: 'HVY-DUMP', lane: 0.5, z: 60, speed: 0, isPrimary: true },
-    // Oncoming vehicle
-    { id: 'D-02', type: 'HVY-DUMP', lane: -0.6, z: 120, speed: -8, isPrimary: false },
-    // Static obstacle (rock)
-    { id: 'ROCK', type: 'DEBRIS', lane: 0.8, z: 80, speed: -4, isPrimary: false }
-  ])
-
-  useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-    const ctx = canvas.getContext('2d', { alpha: false })
-
-    // Helper: Draw HUD tracking bracket
-    function drawTrackerBox(x, y, w, h, color, bracketLen = 12) {
-      ctx.strokeStyle = color
-      ctx.lineWidth = 1.5
-      ctx.beginPath()
-      ctx.moveTo(x + bracketLen, y); ctx.lineTo(x, y); ctx.lineTo(x, y + bracketLen)
-      ctx.moveTo(x + w - bracketLen, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + bracketLen)
-      ctx.moveTo(x + bracketLen, y + h); ctx.lineTo(x, y + h); ctx.lineTo(x, y + h - bracketLen)
-      ctx.moveTo(x + w - bracketLen, y + h); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w, y + h - bracketLen)
-      ctx.stroke()
-      
-      ctx.lineWidth = 0.5
-      ctx.beginPath()
-      ctx.moveTo(x + w/2 - 4, y + h/2); ctx.lineTo(x + w/2 + 4, y + h/2)
-      ctx.moveTo(x + w/2, y + h/2 - 4); ctx.lineTo(x + w/2, y + h/2 + 4)
-      ctx.stroke()
-    }
-
-    const draw = () => {
-      const { width: W, height: H } = canvas
-      tRef.current += 0.016
-      const t = tRef.current
-      const dir = view === 'BACK' ? -1 : 1
-      const isSide = view === 'LEFT' || view === 'RIGHT'
-      
-      const horizon = H * 0.45
-      const cx = W / 2
-
-      // ──────────────────────────────────────────────────────────
-      // 1. SWIR OPTICAL BASE (High-contrast Monochromatic)
-      // ──────────────────────────────────────────────────────────
-      
-      // Sky: Pitch black (SWIR completely absorbed by atmospheric water vapor)
-      ctx.fillStyle = '#020202'
-      ctx.fillRect(0, 0, W, horizon)
-      
-      // Horizon scattering (very slight grayish band where fog meets ground)
-      const hazeG = ctx.createLinearGradient(0, horizon - 20, 0, horizon + 5)
-      hazeG.addColorStop(0, '#020202')
-      hazeG.addColorStop(0.8, '#1e2124')
-      hazeG.addColorStop(1, '#111214')
-      ctx.fillStyle = hazeG
-      ctx.fillRect(0, horizon - 20, W, 25)
-
-      if (!isSide) {
-        // --- MINE SCENE GENERATION ---
-        
-        // Road surface (compacted ore, medium SWIR reflectance)
-        const roadWTop = W * 0.15
-        const roadWBot = W * 0.9
-        const curve = Math.sin(t * 0.1) * W * 0.05
-        const vanX = cx + curve
-
-        ctx.fillStyle = '#2a2d32' // Grayscale road base
-        ctx.beginPath()
-        ctx.moveTo(vanX - roadWTop, horizon)
-        ctx.lineTo(vanX + roadWTop, horizon)
-        ctx.lineTo(cx + roadWBot, H)
-        ctx.lineTo(cx - roadWBot, H)
-        ctx.fill()
-
-        // Tire tracks (darker gray, smoothed out)
-        ctx.strokeStyle = '#1d1f22'
-        ctx.lineWidth = W * 0.1
-        ctx.beginPath()
-        ctx.moveTo(vanX - roadWTop*0.5, horizon); ctx.lineTo(cx - roadWBot*0.5 + curve*0.3, H)
-        ctx.moveTo(vanX + roadWTop*0.5, horizon); ctx.lineTo(cx + roadWBot*0.5 + curve*0.3, H)
-        ctx.stroke()
-
-        // Highwalls (steep rocky cliffs on sides of the open pit)
-        // Highly reflective in SWIR due to exposed minerals, stark shadows
-        ctx.fillStyle = '#3a3e45'
-        ctx.beginPath()
-        ctx.moveTo(0, H)
-        ctx.lineTo(cx - roadWBot, H)
-        ctx.lineTo(vanX - roadWTop, horizon)
-        ctx.lineTo(vanX - roadWTop - W*0.1, horizon - H*0.1)
-        ctx.lineTo(0, horizon - H*0.2)
-        ctx.fill()
-
-        ctx.fillStyle = '#32353b'
-        ctx.beginPath()
-        ctx.moveTo(W, H)
-        ctx.lineTo(cx + roadWBot, H)
-        ctx.lineTo(vanX + roadWTop, horizon)
-        ctx.lineTo(vanX + roadWTop + W*0.1, horizon - H*0.15)
-        ctx.lineTo(W, horizon - H*0.25)
-        ctx.fill()
-
-        // Draw striations/terraces on the highwalls
-        ctx.strokeStyle = '#111215'
-        ctx.lineWidth = 2
-        for (let i = 1; i <= 4; i++) {
-          const y = horizon + (H-horizon) * (i/5)
-          const lw = cx - roadWBot*(i/5)
-          const rw = cx + roadWBot*(i/5)
-          ctx.beginPath(); ctx.moveTo(0, y - H*0.1); ctx.lineTo(lw, y); ctx.stroke()
-          ctx.beginPath(); ctx.moveTo(W, y - H*0.15); ctx.lineTo(rw, y); ctx.stroke()
-        }
-
-        // Safety berms (crushed bright rock lining the road edge)
-        ctx.strokeStyle = '#4f555e'
-        ctx.lineWidth = 4
-        ctx.beginPath()
-        ctx.moveTo(vanX - roadWTop, horizon); ctx.lineTo(cx - roadWBot, H)
-        ctx.moveTo(vanX + roadWTop, horizon); ctx.lineTo(cx + roadWBot, H)
-        ctx.stroke()
-
-        // Update and sort objects by depth (painters algorithm)
-        const egoSpeed = 4 // Ego vehicle speed simulation
-        const objects = sceneObjects.current
-        
-        objects.forEach(obj => {
-          // Relative motion
-          if (dir === 1) { // FRONT view
-            obj.z += (obj.speed - egoSpeed) * 0.016
-          } else { // BACK view
-            obj.z += (egoSpeed - obj.speed) * 0.016
-          }
-          
-          // Respawn logic to keep scene active without collisions
-          if (obj.z < 10 || obj.z > 150) {
-            if (obj.isPrimary) {
-              obj.z = 40 + Math.random()*20 // Keep primary vehicle at a safe following distance
-              obj.speed = egoSpeed + (Math.random()-0.5)*2
-            } else if (obj.type === 'HVY-DUMP') {
-              obj.z = 150
-              obj.speed = -8 // Fast oncoming
-            } else if (obj.type === 'DEBRIS') {
-              obj.z = 150
-              obj.lane = (Math.random() > 0.5 ? 1 : -1) * (0.6 + Math.random()*0.3)
-            }
-          }
-        })
-
-        objects.sort((a, b) => b.z - a.z)
-
-        // Render Objects
-        objects.forEach(obj => {
-          if (obj.z > 150 || obj.z < 5) return // Cull
-          
-          const depthFrac = 1 - (obj.z / 150)
-          const sc = 15 / obj.z // Perspective scale
-          
-          const objGY = horizon + (H - horizon) * Math.pow(depthFrac, 2)
-          
-          // Base width at horizon vs bottom
-          const currentRoadW = roadWTop + (roadWBot - roadWTop) * depthFrac
-          const laneOffset = obj.lane * currentRoadW
-          
-          const objX = cx + (vanX - cx)*depthFrac + laneOffset
-
-          if (obj.type === 'HVY-DUMP') {
-            const objW = 350 * sc
-            const objH = 280 * sc
-            const objTY = objGY - objH
-            const lx = objX - objW/2
-
-            // SWIR Silhouette 
-            ctx.fillStyle = '#0a0b0d' // Dark metal body
-            
-            // Dump Bed
-            ctx.beginPath()
-            ctx.moveTo(lx - objW*0.05, objTY + objH*0.2)
-            ctx.lineTo(lx + objW*1.05, objTY + objH*0.2)
-            ctx.lineTo(lx + objW, objTY + objH*0.6)
-            ctx.lineTo(lx, objTY + objH*0.6)
-            ctx.closePath()
-            ctx.fill()
-            
-            // Chassis
-            ctx.fillRect(lx + objW*0.15, objTY + objH*0.5, objW*0.7, objH*0.35)
-            
-            // Cab
-            ctx.fillStyle = '#121418'
-            ctx.fillRect(lx + objW*0.2, objTY + objH*0.1, objW*0.25, objH*0.4)
-            
-            // Tires (Rubber absorbs SWIR, pitch black)
-            ctx.fillStyle = '#000000'
-            const tw = objW*0.22, th = objH*0.28
-            ctx.fillRect(lx + objW*0.05, objGY - th, tw, th)
-            ctx.fillRect(lx + objW*0.73, objGY - th, tw, th)
-
-            // SWIR Heat Signatures (Radiator / Exhaust glow bright white)
-            const exX = lx + objW*0.6
-            const exY = objTY + objH*0.4
-            const exG = ctx.createRadialGradient(exX, exY, 0, exX, exY, 50*sc)
-            exG.addColorStop(0, `rgba(255,255,255,${0.9 + Math.sin(t*8)*0.1})`)
-            exG.addColorStop(0.4, 'rgba(200,210,220,0.5)')
-            exG.addColorStop(1, 'rgba(0,0,0,0)')
-            ctx.fillStyle = exG
-            ctx.beginPath(); ctx.arc(exX, exY, 50*sc, 0, Math.PI*2); ctx.fill()
-
-            // ──────────────────────────────────────────────────────────
-            // 4D RADAR POINT CLOUD FUSION (Target mapped)
-            // ──────────────────────────────────────────────────────────
-            const nPts = Math.floor(100 * depthFrac * depthFrac)
-            
-            ctx.globalCompositeOperation = 'screen'
-            for (let i = 0; i < nPts; i++) {
-              const px = lx - objW*0.1 + Math.random() * objW*1.2
-              const py = objTY + Math.random() * objH
-              
-              // Doppler Coloring
-              // Cyan/Green for approaching, Orange/Red for receding
-              const relativeSpeed = obj.speed - egoSpeed
-              let color = relativeSpeed < 0 ? `rgba(0, 255, 200, 0.9)` : `rgba(255, 120, 50, 0.9)`
-              
-              // Highlight edges to simulate structural radar returns
-              if (Math.random() < 0.2) color = `rgba(255, 255, 255, 1)`
-              
-              ctx.fillStyle = color
-              const pSize = (1.5 + Math.random()*2) * Math.max(0.5, sc*10)
-              ctx.fillRect(px, py, pSize, pSize)
-              
-              // Velocity Vectors
-              if (i % 8 === 0) {
-                ctx.strokeStyle = color.replace('0.9', '0.4')
-                ctx.lineWidth = 0.8
-                ctx.beginPath()
-                ctx.moveTo(px, py)
-                ctx.lineTo(px, py + relativeSpeed * 2 * sc*10)
-                ctx.stroke()
-              }
-            }
-            ctx.globalCompositeOperation = 'source-over'
-
-            // Fusion HUD for primary target
-            if (obj.isPrimary) {
-              const pad = objW * 0.05
-              const bx = lx - pad, by = objTY - pad
-              const bw = objW + pad*2, bh = objH + pad*1.5
-              
-              drawTrackerBox(bx, by, bw, bh, 'rgba(0, 255, 170, 0.85)', bw * 0.15)
-              
-              const labelX = bx
-              const labelY = by - 38
-              ctx.fillStyle = 'rgba(5, 8, 12, 0.85)'
-              ctx.fillRect(labelX, labelY, 155, 34)
-              ctx.strokeStyle = 'rgba(0, 255, 170, 0.5)'
-              ctx.lineWidth = 1
-              ctx.strokeRect(labelX, labelY, 155, 34)
-              
-              ctx.font = `600 10px 'JetBrains Mono', monospace`
-              ctx.fillStyle = '#00ffaa'
-              ctx.fillText(`TGT: ${obj.id} [HVY-DUMP]`, labelX + 6, labelY + 11)
-              ctx.fillStyle = '#ffffff'
-              ctx.fillText(`R: ${obj.z.toFixed(1)}m | Δv: ${(obj.speed - egoSpeed).toFixed(1)}m/s`, labelX + 6, labelY + 21)
-              ctx.fillStyle = '#ffaa00'
-              ctx.fillText(`CONF: ${(95 + Math.random()*4).toFixed(1)}% TRACKED`, labelX + 6, labelY + 31)
-            }
-          } 
-          else if (obj.type === 'DEBRIS') {
-            // Draw static rock on road
-            const rW = 40 * sc
-            const rH = 25 * sc
-            ctx.fillStyle = '#444' // SWIR bright rock
-            ctx.beginPath()
-            ctx.moveTo(objX - rW/2, objGY)
-            ctx.lineTo(objX - rW*0.3, objGY - rH)
-            ctx.lineTo(objX + rW*0.2, objGY - rH*0.8)
-            ctx.lineTo(objX + rW/2, objGY)
-            ctx.closePath()
-            ctx.fill()
-
-            // Radar points for debris
-            ctx.globalCompositeOperation = 'screen'
-            for (let i = 0; i < 15; i++) {
-              ctx.fillStyle = `rgba(0, 255, 200, 0.9)` // approaching ego
-              const pSize = 1.5 * Math.max(0.5, sc*10)
-              ctx.fillRect(objX - rW/2 + Math.random()*rW, objGY - Math.random()*rH, pSize, pSize)
-            }
-            ctx.globalCompositeOperation = 'source-over'
-          }
-        })
-
-      } else {
-        // SIDE VIEW - Passing highwalls (SWIR monochrome blur)
-        const scroll = (t * 200 * (view === 'LEFT' ? 1 : -1)) % W
-        ctx.fillStyle = '#181a1d'
-        ctx.fillRect(0, horizon, W, H-horizon)
-        
-        ctx.lineWidth = 3
-        for(let i=0; i<20; i++) {
-          const x = (scroll + i*(W/15)) % W
-          const xpos = x < 0 ? x + W : x
-          ctx.strokeStyle = `rgba(100,100,100,${0.05 + Math.random()*0.1})`
-          ctx.beginPath()
-          ctx.moveTo(xpos, horizon)
-          ctx.lineTo(xpos - (H-horizon)*0.8*(view==='LEFT'?1:-1), H)
-          ctx.stroke()
-        }
-      }
-
-      // Ground Clutter (Sparse radar returns on terrain)
-      ctx.globalCompositeOperation = 'screen'
-      for(let i=0; i<30; i++) {
-        const px = Math.random() * W
-        const py = horizon + Math.random() * (H-horizon)
-        if (py > horizon + 10) {
-          ctx.fillStyle = `rgba(0, 255, 200, ${0.1 + Math.random()*0.3})`
-          ctx.fillRect(px, py, 2, 2)
-        }
-      }
-      ctx.globalCompositeOperation = 'source-over'
-
-      // ──────────────────────────────────────────────────────────
-      // POST-PROCESSING (SWIR Grain, Vignette, Scanlines)
-      // ──────────────────────────────────────────────────────────
-      if (noiseRef.current) {
-        ctx.globalCompositeOperation = 'overlay'
-        ctx.globalAlpha = 0.25 // Heavy SWIR grain
-        const nX = (Math.random() * 256) | 0
-        const nY = (Math.random() * 256) | 0
-        ctx.drawImage(noiseRef.current, nX, nY, 256, 256, 0, 0, W, H)
-        ctx.globalCompositeOperation = 'source-over'
-        ctx.globalAlpha = 1.0
-      }
-
-      const vig = ctx.createRadialGradient(cx, H/2, H*0.3, cx, H/2, W*0.75)
-      vig.addColorStop(0, 'rgba(0,0,0,0)')
-      vig.addColorStop(1, 'rgba(0,0,0,0.7)')
-      ctx.fillStyle = vig
-      ctx.fillRect(0, 0, W, H)
-
-      const scanY = (t * 300) % H
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.05)'
-      ctx.fillRect(0, scanY, W, 4)
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.2)'
-      ctx.fillRect(0, scanY-20, W, 20)
-
-      // Technical HUD overlays emphasizing Fusion
-      ctx.font = `700 11px 'JetBrains Mono', monospace`
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.9)'
-      ctx.fillText('OPTICAL: SWIR (1550nm) [GRAYSCALE]', 16, 24)
-      ctx.fillStyle = 'rgba(0, 255, 170, 0.9)'
-      ctx.fillText('OVERLAY: 4D RADAR (77GHz) [DOPPLER CLOUD]', 16, 40)
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.5)'
-      ctx.fillText(`FPS: ${(24 + Math.random()*2).toFixed(0)} | MODE: FUSED`, 16, 56)
-
-      rafRef.current = requestAnimationFrame(draw)
-    }
-
-    const resize = () => {
-      canvas.width  = canvas.offsetWidth  || 640
-      canvas.height = canvas.offsetHeight || 360
-    }
-    resize()
-    draw()
-
-    const ro = new ResizeObserver(resize)
-    ro.observe(canvas)
-    return () => {
-      cancelAnimationFrame(rafRef.current)
-      ro.disconnect()
-    }
-  }, [view])
-
-  return <canvas ref={canvasRef} className="swir-canvas" style={{ width: '100%', height: '100%', display: 'block' }} />
+/* Suspension: heave / pitch / roll / yaw as damped springs driven by road
+   corrugation (a function of distance travelled, so faster = buzzier) plus
+   a jolt each time a wheel crosses one of the potholes the camera sees. */
+function stepChassis(s, dt, prevOdo) {
+  const c = s.chassis
+  const sp = clamp(s.speed / 3.6 / 4.5, 0.25, 2.2)
+  const o = s.odo
+  const r1 = Math.sin(o * 3.7) * 0.5 + Math.sin(o * 7.9 + 1.3) * 0.3 + Math.sin(o * 13.1 + 2.2) * 0.2
+  const r2 = Math.sin(o * 3.1 + 0.7) * 0.5 + Math.sin(o * 6.3 + 2.9) * 0.3 + Math.sin(o * 11.7 + 0.4) * 0.2
+  const r3 = Math.sin(o * 2.3 + 1.9) * 0.6 + Math.sin(o * 9.1 + 0.5) * 0.4
+  const i0 = Math.floor((prevOdo - 30) / 34)
+  for (let i = i0 - 1; i <= i0 + 2; i++) {
+    const p = pothole(i), side = p.u > 0 ? 1 : -1
+    if (prevOdo < p.z - 3.8 && o >= p.z - 3.8) { c.hv += 0.42 * sp; c.pv += 0.075 * sp; c.rv -= side * 0.1 * sp }   // front wheel
+    if (prevOdo < p.z + 3.4 && o >= p.z + 3.4) { c.hv += 0.3 * sp; c.pv -= 0.05 * sp; c.rv -= side * 0.07 * sp }    // rear wheel
+  }
+  const n = Math.max(1, Math.ceil(dt * 120)), h = dt / n
+  for (let i = 0; i < n; i++) {
+    c.hv += (-100 * c.heave - 5.6 * c.hv + 9 * r1 * sp) * h; c.heave += c.hv * h
+    c.pv += (-67 * c.pitch - 4.9 * c.pv + 2.1 * r2 * sp) * h; c.pitch += c.pv * h
+    c.rv += (-144 * c.roll - 7.2 * c.rv + 3.2 * r3 * sp) * h; c.roll += c.rv * h
+  }
+  c.yaw = 0.0035 * sp * (Math.sin(o * 0.5) + 0.5 * Math.sin(o * 1.7 + 1))
 }
 
+function stepSim(s, dt) {
+  s.speed += (s.goal - s.speed) * Math.min(1, dt * 0.5)
+  const ego = s.speed / 3.6
+  const prevOdo = s.odo
+  s.odo += ego * dt
+  if (dt > 0) stepChassis(s, dt, prevOdo)
+  s.wander = clamp(s.wander + (Math.random() - 0.5) * dt * 1.5, -1.2, 1.2)
+  for (const t of s.targets) {
+    t.vz = ONCOMING.has(t.id) ? -(ego + 4.4) : t.id === 'D-08' ? s.wander : -ego
+    t.z += t.vz * dt
+    if (ONCOMING.has(t.id) && t.z < -25) t.z = 140
+    if (t.id === 'ROCK' && t.z < 12) t.z = 96
+    if (t.id === 'E-02' && t.z < -30) t.z = 110
+    if (t.id === 'D-08') t.z = clamp(t.z, -72, -30)
+    derive(t)
+  }
+}
 
-function CameraView({ view, size = 'full' }) {
-  const meta = VIEW_META[view]
+// Two dumpers share the oncoming lane, offset so one is (almost) always
+// close enough to matter — a haul road this narrow is rarely empty.
+function createSim() {
+  const s = {
+    speed: 16, goal: 16, odo: 0, wander: 0,
+    chassis: { heave: 0, hv: 0, pitch: 0, pv: 0, roll: 0, rv: 0, yaw: 0 },
+    targets: [
+      // Evenly spaced (55 m) so the oncoming lane reads as a convoy —
+      // several trucks ahead at once, not one truck in an empty road.
+      { id: 'D-04', label: 'D-04', name: 'Dumper D-04', kind: 'dumper', z: 113, u: -14, dir: -1 },
+      { id: 'D-11', label: 'D-11', name: 'Dumper D-11', kind: 'dumper', z: 58, u: -13.3, dir: -1 },
+      { id: 'D-15', label: 'D-15', name: 'Dumper D-15', kind: 'dumper', z: 3, u: -14.6, dir: -1 },
+      { id: 'D-08', label: 'D-08', name: 'Dumper D-08', kind: 'dumper', z: -38, u: 0, dir: 1 },
+      { id: 'E-02', label: 'E-02', name: 'Excavator E-02', kind: 'excavator', z: 22, u: 32, dir: 1 },
+      { id: 'ROCK', label: 'Rock', name: 'Rock on road', kind: 'debris', z: 72, u: 4, dir: 1 },
+    ],
+  }
+  stepSim(s, 0)
+  return s
+}
 
+const snapshot = (s, t0) => ({
+  speed: s.speed,
+  targets: s.targets.map(t => ({ ...t })),
+  mapAge: 4 + Math.floor((Date.now() - t0) / 60000),
+})
+
+
+const Icon = ({ children, size = 22 }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{children}</svg>
+)
+const ArrowIcon = ({ deg }) => (
+  <Icon><g transform={`rotate(${deg} 12 12)`}><path d="M12 19V5M6 11l6-6 6 6" /></g></Icon>
+)
+const LayoutIcon = ({ id }) => (
+  <Icon>
+    {id === 'single' && <rect x="3" y="5" width="18" height="14" rx="2" />}
+    {id === 'focus' && <><rect x="3" y="5" width="12" height="14" rx="2" /><rect x="17.5" y="5" width="3.5" height="3.6" rx="1" /><rect x="17.5" y="10.2" width="3.5" height="3.6" rx="1" /><rect x="17.5" y="15.4" width="3.5" height="3.6" rx="1" /></>}
+    {id === 'quad' && <><rect x="3" y="5" width="8" height="6" rx="1.5" /><rect x="13" y="5" width="8" height="6" rx="1.5" /><rect x="3" y="13" width="8" height="6" rx="1.5" /><rect x="13" y="13" width="8" height="6" rx="1.5" /></>}
+  </Icon>
+)
+
+function CameraTile({ view, mode, sim, theme, info, onSelect }) {
+  const label = VIEWS.find(v => v.id === view).label
+  const clickable = mode !== 'main'
+  const n = info.nearest
+  const src = n && !n.inSwir ? 'RADAR' : 'FUSED'
   return (
-    <div className={`cam-view cam-view-${size}`} data-view={view}>
-      <div className="cam-view-inner">
-        <SensorFusionCanvas view={view} />
-
-        {/* HUD overlays */}
-        <div className="cam-hud-tl">
-          {meta.veh && <span className="cam-veh-alert">⚠ {meta.veh} · {meta.dist}</span>}
-        </div>
-
-        <div className="cam-hud-tr">
-          <span className="cam-heading">{meta.dir} {meta.heading}</span>
-        </div>
-
-        {meta.dist !== '—' && size === 'full' && (
-          <div className="cam-dist-bar">
-            <div className="cdb-inner">
-              <span className="cdb-label">OBSTACLE DIST</span>
-              <span className="cdb-val">{meta.dist}</span>
-            </div>
-          </div>
-        )}
-
-        {/* Corner brackets */}
-        <div className="cam-bracket tl" />
-        <div className="cam-bracket tr" />
-        <div className="cam-bracket bl" />
-        <div className="cam-bracket br" />
+    <div
+      className={`vd-tile is-${mode}`}
+      data-sev={info.sev}
+      role={clickable ? 'button' : undefined}
+      tabIndex={clickable ? 0 : undefined}
+      aria-label={clickable ? `Show ${label.toLowerCase()} camera` : `${label} camera`}
+      onClick={clickable ? () => onSelect(view) : undefined}
+      onKeyDown={clickable ? e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(view) } } : undefined}
+    >
+      <TwinCanvas view={view} sim={sim} road={ROAD} theme={theme} range={RANGE} />
+      <div className="vd-tile-head">
+        <span className="vd-pill">{label} · {src}</span>
+        <span className="vd-pill" data-sev={n ? n.sev : 'ok'}>{n ? `${n.label} · ${Math.round(n.dist)} m` : 'Clear'}</span>
       </div>
     </div>
   )
 }
 
-function ViewContainer({ splitMode, activeView }) {
-  switch (splitMode) {
-    case 'single':
-      return (
-        <div className="vc-single">
-          <CameraView view={activeView} size="full" />
-        </div>
-      )
-    case 'hsplit':
-      return (
-        <div className="vc-hsplit">
-          <CameraView view="FRONT" size="half" />
-          <CameraView view="BACK"  size="half" />
-        </div>
-      )
-    case 'vsplit':
-      return (
-        <div className="vc-vsplit">
-          <CameraView view="FRONT" size="half" />
-          <CameraView view="RIGHT" size="half" />
-        </div>
-      )
-    case 'quad':
-      return (
-        <div className="vc-quad">
-          <CameraView view="FRONT" size="quad" />
-          <CameraView view="RIGHT" size="quad" />
-          <CameraView view="LEFT"  size="quad" />
-          <CameraView view="BACK"  size="quad" />
-        </div>
-      )
-    case 'focus3':
-      return (
-        <div className="vc-focus3">
-          <div className="vc-focus3-main">
-            <CameraView view={activeView} size="focus" />
-          </div>
-          <div className="vc-focus3-thumbs">
-            {VIEWS.filter(v => v !== activeView).map(v => (
-              <CameraView key={v} view={v} size="thumb" />
-            ))}
-          </div>
-        </div>
-      )
-    default:
-      return null
-  }
+function StageGrid({ layout, activeView, sim, theme, bySector, onSelect }) {
+  if (layout === 'single')
+    return <div className="vd-grid" data-layout="single"><CameraTile view={activeView} mode="main" sim={sim} theme={theme} info={bySector[activeView]} onSelect={onSelect} /></div>
+  if (layout === 'focus')
+    return (
+      <div className="vd-grid" data-layout="focus">
+        <CameraTile view={activeView} mode="main" sim={sim} theme={theme} info={bySector[activeView]} onSelect={onSelect} />
+        {VIEWS.filter(v => v.id !== activeView).map(v => (
+          <CameraTile key={v.id} view={v.id} mode="thumb" sim={sim} theme={theme} info={bySector[v.id]} onSelect={onSelect} />
+        ))}
+      </div>
+    )
+  return (
+    <div className="vd-grid" data-layout="quad">
+      {['FRONT', 'REAR', 'LEFT', 'RIGHT'].map(v => (
+        <CameraTile key={v} view={v} mode="quad" sim={sim} theme={theme} info={bySector[v]} onSelect={onSelect} />
+      ))}
+    </div>
+  )
 }
 
 function LiveClock() {
@@ -526,153 +183,177 @@ function LiveClock() {
   return <span>{pad(time.getHours())}:{pad(time.getMinutes())}:{pad(time.getSeconds())}</span>
 }
 
-
-
 export default function VehicleDashboard({ onBack, onSwitchRole }) {
   const [activeView, setActiveView] = useState('FRONT')
-  const [splitMode,  setSplitMode]  = useState('single')
-  const [showMiniMap, setShowMiniMap] = useState(true)
-  const [speed,  setSpeed]  = useState(18)
-  const [alerts, setAlerts] = useState([])
+  const [layout, setLayout] = useState('single')
+  const [theme, setTheme] = useState('day')
+
+  const simRef = useRef(null)
+  const startRef = useRef(Date.now())
+  if (!simRef.current) simRef.current = createSim()
+  const [ui, setUi] = useState(() => snapshot(simRef.current, startRef.current))
 
   useEffect(() => {
-    const id = setInterval(() => {
-      setSpeed(s => Math.max(5, Math.min(32, s + (Math.random() - 0.5) * 2)))
-    }, 2000)
-    return () => clearInterval(id)
+    const s = simRef.current
+    let raf, last = performance.now()
+    const loop = now => {
+      stepSim(s, Math.min(0.1, (now - last) / 1000))
+      last = now
+      raf = requestAnimationFrame(loop)
+    }
+    raf = requestAnimationFrame(loop)
+    const push = setInterval(() => setUi(snapshot(s, startRef.current)), 250)
+    const pace = setInterval(() => { s.goal = clamp(s.goal + (Math.random() - 0.5) * 5, 10, 24) }, 3000)
+    return () => { cancelAnimationFrame(raf); clearInterval(push); clearInterval(pace) }
   }, [])
 
-  useEffect(() => {
-    const msgs = [
-      { type: 'warn',   text: 'VEH-D04 approaching · 42m' },
-      { type: 'info',   text: 'V2V: VEH-D08 trailing · 55m' },
-      { type: 'warn',   text: 'Road edge L deviation detected' },
-      { type: 'info',   text: 'GNSS fix updated · ±2cm' },
-      { type: 'danger', text: 'Low visibility warning · 3m' },
-    ]
-    let idx = 0
-    const id = setInterval(() => {
-      setAlerts(prev => [
-        { id: Date.now(), ...msgs[idx % msgs.length] },
-        ...prev.slice(0, 2)
-      ])
-      idx++
-    }, 5000)
-    return () => clearInterval(id)
-  }, [])
+  const selectView = v => {
+    setActiveView(v)
+    setLayout(l => (l === 'quad' ? 'focus' : l))
+  }
+
+  const visible = useMemo(() => ui.targets.filter(t => t.dist <= RANGE), [ui])
+
+  const bySector = useMemo(() => {
+    const out = {}
+    VIEWS.forEach(v => { out[v.id] = { nearest: null, sev: 'ok' } })
+    for (const t of visible) {
+      const o = out[t.sector]
+      if (!o.nearest || t.dist < o.nearest.dist) o.nearest = t
+      o.sev = worse(o.sev, t.sev)
+    }
+    return out
+  }, [visible])
+
+  const speed = Math.round(ui.speed)
+  const over = speed > SPEED_LIMIT
+
+  const alerts = useMemo(() => {
+    const list = []
+    if (over) list.push({ key: 'speed', sev: 'caution', title: 'Over speed limit', detail: `${speed} km/h · limit ${SPEED_LIMIT}` })
+    for (const t of visible) {
+      if (t.sev === 'ok') continue
+      const reach = t.inPath && isFinite(t.ttc) && t.ttc < 20 ? ` · reaches you in ${Math.ceil(t.ttc)} s` : ''
+      const src = t.inSwir ? '' : ' · radar only'
+      list.push({ key: t.id, sev: t.sev, view: t.sector, title: `${t.name} ${DIR_WORD[t.sector]}`, detail: `${Math.round(t.dist)} m${reach}${src}` })
+    }
+    return list.sort((a, b) => RANK[b.sev] - RANK[a.sev] || a.key.localeCompare(b.key))
+  }, [visible, over, speed])
+
+  const linked = visible.filter(t => t.kind !== 'debris').length
 
   return (
-    <div className="vd-root">
-      {/* Top bar */}
+    <div className="vd-root" data-theme={theme}>
       <header className="vd-header">
-        <div className="vd-header-left">
-          <button id="vd-btn-back" className="vd-btn-back" onClick={onBack} title="Back to Menu">
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-              <path d="M9 2L4 7l5 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-            </svg>
-            <span>BACK</span>
-          </button>
-
-          <div className="vd-unit-id">
-            <span className="vd-unit-label">UNIT</span>
-            <span className="vd-unit-val mono">D-07</span>
-            <span className="status-dot active" />
-          </div>
-
-          <div className="vd-header-sep" />
-
-          <div className="vd-logo-tag">TRINETRIS</div>
-          <div className="vd-condition-badge">
-            <span className="status-dot warn" />
-            <span>LOW VISIBILITY</span>
-          </div>
+        <button id="vd-btn-back" className="vd-btn" onClick={onBack} title="Back">
+          <Icon size={16}><path d="M15 5l-7 7 7 7" /></Icon>
+          <span className="vd-btn-label">Back</span>
+        </button>
+        <div className="vd-unit">
+          <span className="vd-unit-label">Unit</span>
+          <span className="vd-unit-val">D-07</span>
+          <span className="vd-dot" data-sev="ok" />
         </div>
 
-        <div className="vd-header-right">
-          <div className="vd-header-sep" />
-
-          <button
-            id="vd-btn-minimap"
-            className={`vd-action-btn ${showMiniMap ? 'active' : ''}`}
-            onClick={() => setShowMiniMap(s => !s)}
-            title="Toggle minimap"
-          >
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-              <circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.2"/>
-              <path d="M4 5l2 2-1 3 4-2-1-3 2-2-6 2z" fill="currentColor" opacity="0.7"/>
-            </svg>
-            MAP
-          </button>
-
-          <button
-            id="vd-btn-switch-role"
-            className="vd-action-btn switch"
-            onClick={onSwitchRole}
-            title="Switch to Server Dashboard"
-          >
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-              <path d="M2 7h10M8 3l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
-            </svg>
-            SERVER
-          </button>
-
-          <div className="vd-clock mono"><LiveClock /></div>
+        <div className="vd-status">
+          <span className="vd-chip" data-sev="caution">Low vis · {VISIBILITY_M} m</span>
+          <span className="vd-chip vd-hide-sm" data-sev="ok">SWIR + 4D radar · {SENSORS.ok}/{SENSORS.total}</span>
+          <span className="vd-chip vd-hide-sm" data-sev="ok">V2I · V2V {linked}</span>
         </div>
+
+        <button id="vd-btn-theme" className="vd-btn" onClick={() => setTheme(t => (t === 'day' ? 'night' : 'day'))} title="Switch screen brightness mode">
+          <Icon size={16}>
+            {theme === 'day'
+              ? <path d="M20 14.5A8 8 0 019.5 4a8 8 0 1010.5 10.5z" />
+              : <><circle cx="12" cy="12" r="4" /><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6L17 7M7 17l-1.4 1.4" /></>}
+          </Icon>
+          <span className="vd-btn-label">{theme === 'day' ? 'Night' : 'Day'}</span>
+        </button>
+        <button id="vd-btn-switch-role" className="vd-btn" onClick={onSwitchRole} title="Server view">
+          <span className="vd-btn-label">Server</span>
+          <Icon size={16}><path d="M5 12h14M13 6l6 6-6 6" /></Icon>
+        </button>
+        <div className="vd-clock"><LiveClock /></div>
       </header>
 
-      {/* Main viewport */}
-      <div className="vd-viewport">
-        <ViewContainer splitMode={splitMode} activeView={activeView} />
-
-        {showMiniMap && (
-          <div className="vd-minimap-overlay">
-            <MiniMap />
-          </div>
-        )}
-
-        <div className="vd-alert-stack">
-          {alerts.map(a => (
-            <div key={a.id} className={`vd-alert-toast vdat-${a.type}`}>
-              <span className={`status-dot ${a.type === 'danger' ? 'danger' : a.type === 'warn' ? 'warn' : 'active'}`} />
-              <span>{a.text}</span>
-            </div>
-          ))}
-        </div>
+      <div className="vd-disclaimer">
+        <Icon size={13}><circle cx="12" cy="12" r="9" /><path d="M12 8v5M12 16.2v.1" /></Icon>
+        Simulated interface — not actual output from our system. It shows how we imagine the finished dashboard could look and work.
       </div>
 
-      {/* Bottom Nav Bar */}
-      <div className="vd-bottom-navbar">
-        <div className="vd-view-tabs" role="group" aria-label="Camera view selection">
+      <div className="vd-body">
+        <main className="vd-stage">
+          <StageGrid layout={layout} activeView={activeView} sim={simRef} theme={theme} bySector={bySector} onSelect={selectView} />
+        </main>
+
+        <aside className="vd-panel">
+          <section className="vd-card vd-speed" data-sev={over ? 'caution' : 'ok'}>
+            <div className="vd-card-head"><strong>Speed</strong><span>Limit {SPEED_LIMIT} km/h</span></div>
+            <div className="vd-speed-row">
+              <span className="vd-speed-val">{speed}</span>
+              <span className="vd-speed-unit">km/h</span>
+            </div>
+            <div className="vd-speed-bar" aria-hidden="true">
+              <i style={{ width: `${clamp((ui.speed / 30) * 100, 0, 100)}%` }} />
+              <b style={{ left: `${(SPEED_LIMIT / 30) * 100}%` }} />
+            </div>
+          </section>
+
+          <MiniMap sim={simRef} road={ROAD} range={RANGE} swirRange={SWIR_RANGE} theme={theme} mapAge={ui.mapAge} />
+
+          <section className="vd-card vd-alerts" aria-live="polite">
+            <div className="vd-card-head"><strong>Alerts</strong><span>{alerts.length ? `${alerts.length} active` : 'None'}</span></div>
+            {alerts.length === 0 ? (
+              <p className="vd-clear">All clear within {RANGE} m</p>
+            ) : (
+              <ul className="vd-alert-list">
+                {alerts.map(a => (
+                  <li key={a.key}>
+                    <button className="vd-alert" data-sev={a.sev} disabled={!a.view} onClick={() => a.view && selectView(a.view)}>
+                      <span className="vd-alert-title">{a.title}</span>
+                      <span className="vd-alert-detail">{a.detail}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        </aside>
+      </div>
+
+      <nav className="vd-navbar" aria-label="Camera controls">
+        <div className="vd-nav-group" role="group" aria-label="Camera">
+          <span className="vd-nav-label">Camera</span>
           {VIEWS.map(v => (
             <button
-              key={v}
-              id={`vd-tab-${v.toLowerCase()}`}
-              className={`vd-view-tab ${activeView === v && splitMode === 'single' ? 'active' : ''}`}
-              onClick={() => { setActiveView(v); setSplitMode('single') }}
-              title={`${v} camera view`}
+              key={v.id}
+              id={`vd-tab-${v.id.toLowerCase()}`}
+              className={`vd-tab ${activeView === v.id && layout !== 'quad' ? 'active' : ''}`}
+              onClick={() => selectView(v.id)}
+              aria-pressed={activeView === v.id && layout !== 'quad'}
             >
-              {v}
+              <ArrowIcon deg={v.deg} />
+              {v.label}
+              {bySector[v.id].sev !== 'ok' && <span className="vd-tab-dot" data-sev={bySector[v.id].sev} title={bySector[v.id].sev === 'danger' ? 'Danger' : 'Caution'} />}
             </button>
           ))}
         </div>
-
-        <div className="vd-split-btns" role="group" aria-label="Split screen modes">
-          {SPLIT_MODES.map(m => (
+        <div className="vd-nav-group" role="group" aria-label="Layout">
+          <span className="vd-nav-label">Layout</span>
+          {LAYOUTS.map(l => (
             <button
-              key={m.id}
-              id={`vd-split-${m.id}`}
-              className={`vd-split-btn ${splitMode === m.id ? 'active' : ''}`}
-              onClick={() => setSplitMode(m.id)}
-              title={m.label}
+              key={l.id}
+              id={`vd-layout-${l.id}`}
+              className={`vd-tab ${layout === l.id ? 'active' : ''}`}
+              onClick={() => setLayout(l.id)}
+              aria-pressed={layout === l.id}
             >
-              <span className="vsb-icon">{m.icon}</span>
-              <span className="vsb-label">{m.label}</span>
+              <LayoutIcon id={l.id} />
+              {l.label}
             </button>
           ))}
         </div>
-      </div>
-
-      
+      </nav>
     </div>
   )
 }
